@@ -15,7 +15,7 @@ st.title("🌊 Assistant Hydrométéo (POC)")
 # Récupération automatique de la clé API depuis Secrets ou l'environnement
 api_key = st.secrets.get("GOOGLE_API_KEY") or os.environ.get("GOOGLE_API_KEY", "")
 
-# Panneau latéral optionnel si pas de Secret configuré
+# Panneau latéral de secours si la clé n'est pas dans les Secrets
 if not api_key:
     st.sidebar.header("Configuration")
     api_key = st.sidebar.text_input("Clé API Gemini", type="password")
@@ -33,7 +33,7 @@ if "engine" not in st.session_state:
             )
         """))
 
-# Outil Hub'Eau
+# Outil d'interrogation Hub'Eau
 @tool
 def charger_donnees_hubeau(recherche: str) -> str:
     """
@@ -66,7 +66,7 @@ def charger_donnees_hubeau(recherche: str) -> str:
     except Exception as e:
         return f"Erreur Hub'Eau : {e}"
 
-# Zone de Chat
+# Interface de Chat
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -83,9 +83,9 @@ if prompt := st.chat_input("Ex : Quels sont les débits récents en Corse (2A) ?
         with st.spinner("Traitement en cours..."):
             try:
                 db = SQLDatabase(st.session_state.engine)
-                # Utilisation de gemini-2.5-flash
+                # Passage au modèle gemini-3.8-flash
                 llm = ChatGoogleGenerativeAI(
-                    model="gemini-2.5-flash", 
+                    model="gemini-3.8-flash", 
                     temperature=0, 
                     google_api_key=api_key
                 )
@@ -114,7 +114,7 @@ if prompt := st.chat_input("Ex : Quels sont les débits récents en Corse (2A) ?
         st.session_state.messages.append({"role": "assistant", "content": output_text})
         st.chat_message("assistant").write(output_text)
 
-        # Affichage du graphique
+        # Graphique
         try:
             df_visu = pd.read_sql("SELECT * FROM debits", con=st.session_state.engine)
             if not df_visu.empty:
