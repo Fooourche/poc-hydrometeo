@@ -20,11 +20,26 @@ if not api_key:
 if "engine" not in st.session_state:
     st.session_state.engine = create_engine("sqlite:///:memory:", echo=False)
 
+def extract_text(response) -> str:
+    """Extrait proprement le texte brut d'un message LLM (gère les listes et strings)."""
+    content = getattr(response, "content", response)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, str):
+                parts.append(p)
+            elif isinstance(p, dict) and "text" in p:
+                parts.append(p["text"])
+        return "".join(parts)
+    return str(content)
+
 def fetch_hubeau(query_str: str, status_box) -> pd.DataFrame:
     headers = {"User-Agent": "Mozilla/5.0"}
     
-    # Nettoyage et séparation des cibles (ex: "2A, 2B")
-    raw_terms = query_str.replace("et", ",").split(",")
+    # Nettoyage et séparation des cibles
+    raw_terms = str(query_str).replace("et", ",").split(",")
     query_terms = [q.strip().upper() for q in raw_terms if q.strip()]
     
     all_obs = []
@@ -72,7 +87,6 @@ if prompt := st.chat_input("Ex : Quels sont les débits récents en 2A et 2B ?")
         st.session_state.messages.append({"role": "user", "content": prompt})
         st.chat_message("user").write(prompt)
         
-        # Bloc d'avancement dynamique sur l'écran
         with st.status("🔍 Traitement en cours...", expanded=True) as status:
             try:
                 llm = ChatGoogleGenerativeAI(
@@ -89,7 +103,9 @@ if prompt := st.chat_input("Ex : Quels sont les débits récents en 2A et 2B ?")
                     f"(ex: 2A, 2B, 38, Isère, Loire) séparés par une virgule depuis cette question. "
                     f"Ne réponds QUE par les valeurs extraites séparées par une virgule : '{prompt}'"
                 )
-                target = llm.invoke([HumanMessage(content=extract_prompt)]).content.strip()
+                res_extract = llm.invoke([HumanMessage(content=extract_prompt)])
+                target = extract_text(res_extract).strip()
+                
                 status.write(f"👉 Zones extraites : `{target}`")
                 print(f"[LOG SERVER] Cibles extraites : {target}")
                 
@@ -120,7 +136,8 @@ if prompt := st.chat_input("Ex : Quels sont les débits récents en 2A et 2B ?")
                         f"{stats.to_string(index=False)}\n\n"
                         f"Rédige une synthèse courte et chiffrée."
                     )
-                    output_text = llm.invoke([HumanMessage(content=synth_prompt)]).content
+                    res_synth = llm.invoke([HumanMessage(content=synth_prompt)])
+                    output_text = extract_text(res_synth)
                     status.update(label="✅ Traitement terminé !", state="complete")
                     
             except Exception as e:
