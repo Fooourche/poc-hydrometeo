@@ -20,6 +20,9 @@ if not api_key:
 if "engine" not in st.session_state:
     st.session_state.engine = create_engine("sqlite:///:memory:", echo=False)
 
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
 def extract_text(response) -> str:
     content = getattr(response, "content", response)
     if isinstance(content, str):
@@ -34,78 +37,98 @@ def extract_text(response) -> str:
         return "".join(parts)
     return str(content)
 
-def fetch_hubeau(query_str: str, status_box) -> pd.DataFrame:
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_hubeau_data_cached(query_terms):
+    """Fonction pure mise en cache pour interroger Hub'Eau"""
     headers = {"User-Agent": "Mozilla/5.0"}
-    
-    # Nettoyage des termes
-    raw_terms = str(query_str).replace("et", ",").split(",")
-    query_terms = [q.strip().upper() for q in raw_terms if q.strip()]
-    
     station_codes = []
     
-    # 1. Interrogation du référentiel pour trouver les stations actives
+    # 1. Référentiel
     for q in query_terms:
-        status_box.write(f"🗺️ Recherche des stations Hub'Eau pour : `{q}`...")
-        print(f"[LOG SERVER] Recherche referentiel pour : {q}")
-        
         if q.isdigit() or q in ['2A', '2B']:
             ref_url = f"https://hubeau.eaufrance.fr/api/v1/hydrometrie/referentiel/stations?code_departement={q}&en_service=true&size=50"
         else:
             ref_url = f"https://hubeau.eaufrance.fr/api/v1/hydrometrie/referentiel/stations?libelle_cours_eau={q}&en_service=true&size=50"
             
         try:
-            res_ref = requests.get(ref_url, headers=headers, timeout=8).json()
-            stations_found = res_ref.get("data", [])
-            for st_info in stations_found:
+            res_ref = requests.get(ref_url, headers=headers, timeout=10).json()
+            for st_info in res_ref.get("data", []):
                 code = st_info.get("code_station") or st_info.get("code_site")
                 if code and code not in station_codes:
                     station_codes.append(code)
-            status_box.write(f"📍 `{q}` : {len(stations_found)} station(s) identifiée(s).")
-        except Exception as e:
-            status_box.write(f"⚠️ Erreur référentiel `{q}` : {e}")
+        except Exception:
+            pass 
 
     if not station_codes:
         return pd.DataFrame()
 
-    # 2. Récupération des débits récents pour l'ensemble des stations trouvées (par paquets de 20)
-    status_box.write(f"📊 Téléchargement des observations pour {len(station_codes)} station(s)...")
+    # 2. Observations avec Pagination
     all_obs = []
-    
-    # Découpage par lots de 20 codes max pour ne pas dépasser la taille d'URL
     chunk_size = 20
+    
     for i in range(0, len(station_codes), chunk_size):
         chunk = station_codes[i:i + chunk_size]
         codes_param = ",".join(chunk)
-        obs_url = f"https://hubeau.eaufrance.fr/api/v1/hydrometrie/observations_tr?code_entite={codes_param}&size=300&grandeur_hydro=Q"
+        obs_url = f"https://hubeau.eaufrance.fr/api/v1/hydrometrie/observations_tr?code_entite={codes_param}&size=20000&grandeur_hydro=Q"
         
-        try:
-            res_obs = requests.get(obs_url, headers=headers, timeout=10).json()
-            obs = [{
-                'date_heure': x['date_obs'], 
-                'debit_m3s': x['resultat_obs'], 
-                'code_station': x['code_entite'],
-                'station': x.get('nom_station', x['code_entite'])
-            } for x in res_obs.get('data', [])]
-            all_obs.extend(obs)
-        except Exception as e:
-            print(f"[LOG SERVER] Erreur observations : {e}")
+        pages_fetched = 0
+        max_pages = 3 
+        
+        while obs_url and pages_fetched < max_pages:
+            try:
+                res_obs = requests.get(obs_url, headers=headers, timeout=15).json()
+                
+                obs = [{
+                    'date_heure': x['date_obs'], 
+                    'debit_m3s': x['resultat_obs'], 
+                    'code_station': x['code_entite'],
+                    'station': x.get('nom_station', x['code_entite'])
+                } for x in res_obs.get('data', [])]
+                all_obs.extend(obs)
+                
+                obs_url = res_obs.get('next')
+                pages_fetched += 1
+            except Exception:
+                break 
 
-    if all_obs:
-        df = pd.DataFrame(all_obs)
-        df.to_sql("debits", con=st.session_state.engine, if_exists="replace", index=False)
-        return df
-    return pd.DataFrame()
+    # 3. Nettoyage Pandas
+    df = pd.DataFrame(all_obs)
+    if not df.empty:
+        df['date_heure'] = pd.to_datetime(df['date_heure'], utc=True)
+        df = df.dropna(subset=['debit_m3s']) 
+        df = df.sort_values('date_heure')
+        
+    return df
 
-# Historique Chat
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+
+def fetch_hubeau(query_str: str, status_box) -> pd.DataFrame:
+    """Wrapper pour l'UI, SQLite et le Session State"""
+    raw_terms = str(query_str).replace("et", ",").split(",")
+    query_terms = [q.strip().upper() for q in raw_terms if q.strip()]
+    
+    status_box.write(f"🗺️ Interrogation Hub'Eau pour : `{', '.join(query_terms)}`...")
+    
+    df = fetch_hubeau_data_cached(query_terms)
+    
+    if df.empty:
+        return pd.DataFrame()
+        
+    status_box.write(f"📊 {len(df)} observations récupérées et nettoyées.")
+    
+    # Injection dans SQLite et sauvegarde dans le state pour Plotly
+    df.to_sql("debits", con=st.session_state.engine, if_exists="replace", index=False)
+    st.session_state.df_visu = df 
+    
+    return df
+
+# --- INTERFACE UTILISATEUR CHAT ---
 
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
 
-if prompt := st.chat_input("Ex : Quels sont les débits récents en 2A et 2B ?"):
+if prompt := st.chat_input("Ex : Quels sont les débits récents en Isère ?"):
     if not api_key:
-        st.error("Ajoute ta clé API Gemini dans les Secrets.")
+        st.error("Ajoute ta clé API Gemini dans les Secrets ou la barre latérale.")
     else:
         st.session_state.messages.append({"role": "user", "content": prompt})
         st.chat_message("user").write(prompt)
@@ -118,7 +141,7 @@ if prompt := st.chat_input("Ex : Quels sont les débits récents en 2A et 2B ?")
                     google_api_key=api_key
                 )
                 
-                # Étape 1
+                # Étape 1 : Extraction
                 status.write("🧠 **Étape 1/4** : Identification des zones géographiques...")
                 extract_prompt = (
                     f"Extrais uniquement les noms de cours d'eau, villes ou numéros de départements "
@@ -130,7 +153,7 @@ if prompt := st.chat_input("Ex : Quels sont les débits récents en 2A et 2B ?")
                 target = extract_text(res_extract).strip()
                 status.write(f"👉 Recherche ciblée : `{target}`")
                 
-                # Étape 2
+                # Étape 2 : Hub'Eau
                 status.write("📊 **Étape 2/4** : Consultation du référentiel Hub'Eau...")
                 df = fetch_hubeau(target, status_box=status)
                 
@@ -138,7 +161,7 @@ if prompt := st.chat_input("Ex : Quels sont les débits récents en 2A et 2B ?")
                     output_text = f"Aucune donnée d'observation récente disponible sur Hub'Eau pour '{target}'."
                     status.update(label="⚠️ Aucune donnée trouvée", state="complete")
                 else:
-                    # Étape 3
+                    # Étape 3 : SQLite
                     status.write("⚡ **Étape 3/4** : Traitement des données dans SQLite...")
                     stats = pd.read_sql(
                         "SELECT station, MIN(debit_m3s) as min_m3s, MAX(debit_m3s) as max_m3s, AVG(debit_m3s) as moy_m3s "
@@ -146,7 +169,7 @@ if prompt := st.chat_input("Ex : Quels sont les débits récents en 2A et 2B ?")
                         con=st.session_state.engine
                     )
                     
-                    # Étape 4
+                    # Étape 4 : Synthèse IA
                     status.write("✍️ **Étape 4/4** : Synthèse par l'expert IA...")
                     synth_prompt = (
                         f"Tu es un expert hydrométéorologue. "
@@ -166,14 +189,13 @@ if prompt := st.chat_input("Ex : Quels sont les débits récents en 2A et 2B ?")
         st.session_state.messages.append({"role": "assistant", "content": output_text})
         st.chat_message("assistant").write(output_text)
 
-        # Graphique
+        # Rendu du graphique Plotly
         try:
-            df_visu = pd.read_sql("SELECT * FROM debits", con=st.session_state.engine)
-            if not df_visu.empty:
+            if "df_visu" in st.session_state and not st.session_state.df_visu.empty:
                 st.subheader("📊 Débits observés par station")
-                fig = px.line(df_visu, x='date_heure', y='debit_m3s', color='station',
+                fig = px.line(st.session_state.df_visu, x='date_heure', y='debit_m3s', color='station',
                               labels={'date_heure': 'Date/Heure', 'debit_m3s': 'Débit (m³/s)'})
                 st.plotly_chart(fig, use_container_width=True)
-        except Exception:
-            pass
+        except Exception as e:
+            st.error(f"Erreur graphique : {e}")
             
