@@ -1,8 +1,11 @@
 import os
+import json
 import requests
 import pandas as pd
-import plotly.express as px
 import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from sqlalchemy import create_engine
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage
@@ -39,11 +42,11 @@ def extract_text(response) -> str:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_hubeau_data_cached(query_terms):
-    """Fonction pure mise en cache pour interroger Hub'Eau"""
+    """Fonction pure mise en cache pour interroger Hub'Eau (inclus Surface BV et Cours d'eau)"""
     headers = {"User-Agent": "Mozilla/5.0"}
-    station_codes = []
+    stations_meta = {}
     
-    # 1. Référentiel
+    # 1. Référentiel : Récupération des métadonnées (Station, Rivière, Surface BV)
     for q in query_terms:
         if q.isdigit() or q in ['2A', '2B']:
             ref_url = f"https://hubeau.eaufrance.fr/api/v1/hydrometrie/referentiel/stations?code_departement={q}&en_service=true&size=50"
@@ -54,13 +57,21 @@ def fetch_hubeau_data_cached(query_terms):
             res_ref = requests.get(ref_url, headers=headers, timeout=10).json()
             for st_info in res_ref.get("data", []):
                 code = st_info.get("code_station") or st_info.get("code_site")
-                if code and code not in station_codes:
-                    station_codes.append(code)
+                if code and code not in stations_meta:
+                    # Sécurisation de la surface de bassin versant (priorité topo, sinon réel, sinon 0)
+                    bv = st_info.get("surface_bassin_versant_topographique") or st_info.get("surface_bassin_versant_reel") or 0.0
+                    stations_meta[code] = {
+                        "nom_station": st_info.get("libelle_station", code),
+                        "cours_eau": st_info.get("libelle_cours_eau", "Inconnu"),
+                        "surface_bv": bv
+                    }
         except Exception:
             pass 
 
-    if not station_codes:
+    if not stations_meta:
         return pd.DataFrame()
+
+    station_codes = list(stations_meta.keys())
 
     # 2. Observations avec Pagination
     all_obs = []
@@ -78,13 +89,29 @@ def fetch_hubeau_data_cached(query_terms):
             try:
                 res_obs = requests.get(obs_url, headers=headers, timeout=15).json()
                 
-                obs = [{
-                    'date_heure': x['date_obs'], 
-                    'debit_m3s': x['resultat_obs'], 
-                    'code_station': x['code_entite'],
-                    'station': x.get('nom_station', x['code_entite'])
-                } for x in res_obs.get('data', [])]
-                all_obs.extend(obs)
+                for x in res_obs.get('data', []):
+                    code = x['code_entite']
+                    meta = stations_meta.get(code, {})
+                    
+                    q_m3s = x['resultat_obs']
+                    bv = meta['surface_bv']
+                    
+                    # Calcul du débit spécifique (l/s/km²) si le BV est connu
+                    q_sp = (q_m3s * 1000 / bv) if bv > 0 else None
+                    
+                    bv_str = f"{bv} km²" if bv > 0 else "BV Inconnu"
+                    label_complet = f"{meta['nom_station']} ({meta['cours_eau']}) - {bv_str}"
+
+                    all_obs.append({
+                        'date_heure': x['date_obs'], 
+                        'debit_m3s': q_m3s, 
+                        'debit_specifique': q_sp,
+                        'code_station': code,
+                        'station': meta['nom_station'],
+                        'cours_eau': meta['cours_eau'],
+                        'surface_bv': bv,
+                        'label_complet': label_complet
+                    })
                 
                 obs_url = res_obs.get('next')
                 pages_fetched += 1
@@ -113,9 +140,9 @@ def fetch_hubeau(query_str: str, status_box) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
         
-    status_box.write(f"📊 {len(df)} observations récupérées et nettoyées.")
+    status_box.write(f"📊 {len(df)} observations récupérées avec métadonnées.")
     
-    # Injection dans SQLite et sauvegarde dans le state pour Plotly
+    # Injection dans SQLite
     df.to_sql("debits", con=st.session_state.engine, if_exists="replace", index=False)
     st.session_state.df_visu = df 
     
@@ -126,7 +153,7 @@ def fetch_hubeau(query_str: str, status_box) -> pd.DataFrame:
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
 
-if prompt := st.chat_input("Ex : Quels sont les débits récents en Isère ?"):
+if prompt := st.chat_input("Ex : Quels sont les débits en Isère sur les 3 derniers jours ?"):
     if not api_key:
         st.error("Ajoute ta clé API Gemini dans les Secrets ou la barre latérale.")
     else:
@@ -141,31 +168,46 @@ if prompt := st.chat_input("Ex : Quels sont les débits récents en Isère ?"):
                     google_api_key=api_key
                 )
                 
-                # Étape 1 : Extraction
-                status.write("🧠 **Étape 1/4** : Identification des zones géographiques...")
-                extract_prompt = (
-                    f"Extrais uniquement les noms de cours d'eau, villes ou numéros de départements "
-                    f"(ex: 2A, 2B, 38, Isère, Loire, Corse) séparés par une virgule depuis cette question. "
-                    f"Si la question parle de 'Corse', réponds '2A, 2B'. "
-                    f"Ne réponds QUE par les valeurs extraites : '{prompt}'"
-                )
+                # Étape 1 : Extraction JSON
+                status.write("🧠 **Étape 1/4** : Analyse sémantique temporelle et spatiale...")
+                extract_prompt = f"""
+                Analyse la question de l'utilisateur. Extrais les lieux et estime la durée.
+                Tu dois OBLIGATOIREMENT répondre avec un objet JSON valide, selon cette structure exacte :
+                {{
+                    "lieux": ["lieu1", "lieu2"], // Liste des départements, rivières ou villes (ex: "38", "Isère", "2A")
+                    "jours_historique": entier // Nombre de jours d'historique (7 par défaut)
+                }}
+                Question : '{prompt}'
+                """
                 res_extract = llm.invoke([HumanMessage(content=extract_prompt)])
-                target = extract_text(res_extract).strip()
-                status.write(f"👉 Recherche ciblée : `{target}`")
+                raw_json = extract_text(res_extract).strip()
+                
+                # Nettoyage Markdown si Gemini formate sa réponse avec des backticks
+                if raw_json.startswith("```json"):
+                    raw_json = raw_json[7:-3].strip()
+                elif raw_json.startswith("```"):
+                    raw_json = raw_json[3:-3].strip()
+                
+                extraction = json.loads(raw_json)
+                target = ",".join(extraction.get("lieux", []))
+                jours = extraction.get("jours_historique", 7)
+                
+                status.write(f"👉 Cible : `{target}` (Historique analysé : {jours} jours)")
                 
                 # Étape 2 : Hub'Eau
-                status.write("📊 **Étape 2/4** : Consultation du référentiel Hub'Eau...")
+                status.write("📊 **Étape 2/4** : Consultation de Hub'Eau...")
                 df = fetch_hubeau(target, status_box=status)
                 
                 if df.empty:
                     output_text = f"Aucune donnée d'observation récente disponible sur Hub'Eau pour '{target}'."
                     status.update(label="⚠️ Aucune donnée trouvée", state="complete")
                 else:
-                    # Étape 3 : SQLite
+                    # Étape 3 : SQLite (Mise à jour avec nouvelles colonnes)
                     status.write("⚡ **Étape 3/4** : Traitement des données dans SQLite...")
                     stats = pd.read_sql(
-                        "SELECT station, MIN(debit_m3s) as min_m3s, MAX(debit_m3s) as max_m3s, AVG(debit_m3s) as moy_m3s "
-                        "FROM debits GROUP BY station", 
+                        "SELECT station, cours_eau, surface_bv, "
+                        "MIN(debit_m3s) as min_m3s, MAX(debit_m3s) as max_m3s, AVG(debit_m3s) as moy_m3s "
+                        "FROM debits GROUP BY station, cours_eau, surface_bv", 
                         con=st.session_state.engine
                     )
                     
@@ -173,10 +215,9 @@ if prompt := st.chat_input("Ex : Quels sont les débits récents en Isère ?"):
                     status.write("✍️ **Étape 4/4** : Synthèse par l'expert IA...")
                     synth_prompt = (
                         f"Tu es un expert hydrométéorologue. "
-                        f"Question : {prompt}\n\n"
-                        f"Données réelles des stations Hub'Eau (SQLite) :\n"
-                        f"{stats.to_string(index=False)}\n\n"
-                        f"Rédige une synthèse professionnelle chiffrée avec les débits max/min observés."
+                        f"Question de l'utilisateur : {prompt}\n\n"
+                        f"Données réelles des stations :\n{stats.to_string(index=False)}\n\n"
+                        f"Rédige une synthèse professionnelle courte et chiffrée. N'invente AUCUN débit."
                     )
                     res_synth = llm.invoke([HumanMessage(content=synth_prompt)])
                     output_text = extract_text(res_synth)
@@ -189,13 +230,48 @@ if prompt := st.chat_input("Ex : Quels sont les débits récents en Isère ?"):
         st.session_state.messages.append({"role": "assistant", "content": output_text})
         st.chat_message("assistant").write(output_text)
 
-        # Rendu du graphique Plotly
+        # Rendu du graphique Plotly (Double Axe)
         try:
             if "df_visu" in st.session_state and not st.session_state.df_visu.empty:
-                st.subheader("📊 Débits observés par station")
-                fig = px.line(st.session_state.df_visu, x='date_heure', y='debit_m3s', color='station',
-                              labels={'date_heure': 'Date/Heure', 'debit_m3s': 'Débit (m³/s)'})
-                st.plotly_chart(fig, use_container_width=True)
-        except Exception as e:
-            st.error(f"Erreur graphique : {e}")
-            
+                st.subheader("📊 Dynamique hydrologique observée")
+                
+                # Création de la figure avec deux axes Y
+                fig = make_subplots(specs=[[{"secondary_y": True}]])
+                colors = px.colors.qualitative.Plotly
+                
+                # Regroupement par Station/Rivière/BV pour construire les courbes
+                for idx, (label, df_station) in enumerate(st.session_state.df_visu.groupby('label_complet')):
+                    color = colors[idx % len(colors)]
+                    
+                    # Axe Primaire : Débit absolu (m3/s) en trait plein
+                    fig.add_trace(
+                        go.Scatter(
+                            x=df_station['date_heure'], 
+                            y=df_station['debit_m3s'], 
+                            name=f"Q - {label}",
+                            mode='lines',
+                            line=dict(color=color),
+                            legendgroup=label, # Lie les deux courbes dans la légende
+                            hovertemplate="<b>%{x}</b><br>Débit: %{y:.2f} m³/s<extra></extra>"
+                        ),
+                        secondary_y=False
+                    )
+                    
+                    # Axe Secondaire : Débit spécifique (l/s/km2) en pointillés
+                    if df_station['debit_specifique'].notna().any():
+                        fig.add_trace(
+                            go.Scatter(
+                                x=df_station['date_heure'], 
+                                y=df_station['debit_specifique'], 
+                                name=f"Qsp - {label}",
+                                mode='lines',
+                                line=dict(color=color, dash='dot'),
+                                legendgroup=label,
+                                showlegend=False, # Évite de doubler la légende
+                                hovertemplate="<b>%{x}</b><br>Débit Spé: %{y:.2f} l/s/km²<extra></extra>"
+                            ),
+                            secondary_y=True
+                        )
+
+                # Optimisation de l'affichage
+
