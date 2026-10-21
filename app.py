@@ -274,4 +274,18 @@ if prompt := st.chat_input("Ex : Quels sont les débits en Isère sur les 3 dern
                         )
 
                 # Optimisation de l'affichage
-
+                fig.update_layout(
+                    template="plotly_white",
+                    hovermode="x unified",
+                    legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5),
+                    margin=dict(l=20, r=20, t=30, b=20)
+                )
+                
+                # Titres des axes
+                fig.update_yaxes(title_text="<b>Débit</b> (m³/s)", secondary_y=False)
+                fig.update_yaxes(title_text="<b>Débit spécifique</b> (l/s/km²)", secondary_y=True)
+                
+                st.plotly_chart(fig, use_container_width=True)
+                
+        except Exception as e:
+            st.error(f"Erreur graphique : {e}")
