@@ -12,13 +12,15 @@ from langchain_core.tools import tool
 st.set_page_config(page_title="POC Hydrométéo", layout="wide")
 st.title("🌊 Assistant Hydrométéo (POC)")
 
-# Clé API Gemini
-st.sidebar.header("Configuration")
-api_key = st.sidebar.text_input("Clé API Gemini", type="password")
-if not api_key:
-    api_key = os.environ.get("GOOGLE_API_KEY", "")
+# Récupération automatique de la clé API depuis Secrets ou l'environnement
+api_key = st.secrets.get("GOOGLE_API_KEY") or os.environ.get("GOOGLE_API_KEY", "")
 
-# Création du moteur SQLite en mémoire dans la session
+# Panneau latéral optionnel si pas de Secret configuré
+if not api_key:
+    st.sidebar.header("Configuration")
+    api_key = st.sidebar.text_input("Clé API Gemini", type="password")
+
+# Initialisation de SQLite en mémoire
 if "engine" not in st.session_state:
     st.session_state.engine = create_engine("sqlite:///:memory:", echo=False)
     with st.session_state.engine.connect() as conn:
@@ -31,7 +33,7 @@ if "engine" not in st.session_state:
             )
         """))
 
-# Outil pour charger Hub'Eau directement dans SQLite
+# Outil Hub'Eau
 @tool
 def charger_donnees_hubeau(recherche: str) -> str:
     """
@@ -64,7 +66,7 @@ def charger_donnees_hubeau(recherche: str) -> str:
     except Exception as e:
         return f"Erreur Hub'Eau : {e}"
 
-# Chat
+# Zone de Chat
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -73,16 +75,20 @@ for msg in st.session_state.messages:
 
 if prompt := st.chat_input("Ex : Quels sont les débits récents en Corse (2A) ?"):
     if not api_key:
-        st.error("Renseigne ta clé API Gemini dans le panneau de gauche.")
+        st.error("Aucune clé API Gemini détectée. Configure les Secrets dans Streamlit Cloud.")
     else:
         st.session_state.messages.append({"role": "user", "content": prompt})
         st.chat_message("user").write(prompt)
         
         with st.spinner("Traitement en cours..."):
             try:
-                # Connexion SQLDatabase native à SQLite
                 db = SQLDatabase(st.session_state.engine)
-                llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, google_api_key=api_key)
+                # Utilisation de gemini-2.5-flash
+                llm = ChatGoogleGenerativeAI(
+                    model="gemini-2.5-flash", 
+                    temperature=0, 
+                    google_api_key=api_key
+                )
                 
                 prefix_prompt = (
                     "Tu es un expert hydrométéorologue. "
@@ -108,7 +114,7 @@ if prompt := st.chat_input("Ex : Quels sont les débits récents en Corse (2A) ?
         st.session_state.messages.append({"role": "assistant", "content": output_text})
         st.chat_message("assistant").write(output_text)
 
-        # Graphique post-analyse
+        # Affichage du graphique
         try:
             df_visu = pd.read_sql("SELECT * FROM debits", con=st.session_state.engine)
             if not df_visu.empty:
