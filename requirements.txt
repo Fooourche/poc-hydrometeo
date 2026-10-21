@@ -7,4 +7,4 @@ duckdb-engine
 sqlalchemy
 langchain
 langchain-community
-langchain-mistralai
+langchain-google-genai
