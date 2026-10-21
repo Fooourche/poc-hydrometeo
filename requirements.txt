@@ -1,0 +1,10 @@
+streamlit
+plotly
+pandas
+requests
+duckdb
+duckdb-engine
+sqlalchemy
+langchain
+langchain-community
+langchain-mistralai
