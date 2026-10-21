@@ -7,6 +7,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from sqlalchemy import create_engine
+from pydantic import BaseModel, Field
+from typing import List
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage
 
@@ -40,6 +42,11 @@ def extract_text(response) -> str:
         return "".join(parts)
     return str(content)
 
+# Modèle Pydantic pour sécuriser l'extraction sémantique
+class RequeteHydro(BaseModel):
+    lieux: List[str] = Field(description="Liste des départements, cours d'eau ou villes mentionnés")
+    jours_historique: int = Field(default=7, description="Nombre de jours d'historique souhaités")
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_hubeau_data_cached(query_terms):
     """Fonction pure mise en cache pour interroger Hub'Eau (inclus Surface BV et Cours d'eau)"""
@@ -58,7 +65,6 @@ def fetch_hubeau_data_cached(query_terms):
             for st_info in res_ref.get("data", []):
                 code = st_info.get("code_station") or st_info.get("code_site")
                 if code and code not in stations_meta:
-                    # Sécurisation de la surface de bassin versant (priorité topo, sinon réel, sinon 0)
                     bv = st_info.get("surface_bassin_versant_topographique") or st_info.get("surface_bassin_versant_reel") or 0.0
                     stations_meta[code] = {
                         "nom_station": st_info.get("libelle_station", code),
@@ -168,29 +174,33 @@ if prompt := st.chat_input("Ex : Quels sont les débits en Isère sur les 3 dern
                     google_api_key=api_key
                 )
                 
-                # Étape 1 : Extraction JSON
-                status.write("🧠 **Étape 1/4** : Analyse sémantique temporelle et spatiale...")
+                # Étape 1 : Extraction JSON validée par Pydantic
+                status.write("🧠 **Étape 1/4** : Analyse sémantique (Pydantic)...")
                 extract_prompt = f"""
                 Analyse la question de l'utilisateur. Extrais les lieux et estime la durée.
                 Tu dois OBLIGATOIREMENT répondre avec un objet JSON valide, selon cette structure exacte :
                 {{
-                    "lieux": ["lieu1", "lieu2"], // Liste des départements, rivières ou villes (ex: "38", "Isère", "2A")
-                    "jours_historique": entier // Nombre de jours d'historique (7 par défaut)
+                    "lieux": ["lieu1", "lieu2"], 
+                    "jours_historique": entier
                 }}
                 Question : '{prompt}'
                 """
                 res_extract = llm.invoke([HumanMessage(content=extract_prompt)])
                 raw_json = extract_text(res_extract).strip()
                 
-                # Nettoyage Markdown si Gemini formate sa réponse avec des backticks
                 if raw_json.startswith("```json"):
                     raw_json = raw_json[7:-3].strip()
                 elif raw_json.startswith("```"):
                     raw_json = raw_json[3:-3].strip()
                 
-                extraction = json.loads(raw_json)
-                target = ",".join(extraction.get("lieux", []))
-                jours = extraction.get("jours_historique", 7)
+                try:
+                    data_brute = json.loads(raw_json)
+                    params = RequeteHydro(**data_brute)
+                    target = ",".join(params.lieux)
+                    jours = params.jours_historique
+                except Exception:
+                    target = prompt
+                    jours = 7
                 
                 status.write(f"👉 Cible : `{target}` (Historique analysé : {jours} jours)")
                 
@@ -202,7 +212,7 @@ if prompt := st.chat_input("Ex : Quels sont les débits en Isère sur les 3 dern
                     output_text = f"Aucune donnée d'observation récente disponible sur Hub'Eau pour '{target}'."
                     status.update(label="⚠️ Aucune donnée trouvée", state="complete")
                 else:
-                    # Étape 3 : SQLite (Mise à jour avec nouvelles colonnes)
+                    # Étape 3 : SQLite
                     status.write("⚡ **Étape 3/4** : Traitement des données dans SQLite...")
                     stats = pd.read_sql(
                         "SELECT station, cours_eau, surface_bv, "
@@ -235,15 +245,12 @@ if prompt := st.chat_input("Ex : Quels sont les débits en Isère sur les 3 dern
             if "df_visu" in st.session_state and not st.session_state.df_visu.empty:
                 st.subheader("📊 Dynamique hydrologique observée")
                 
-                # Création de la figure avec deux axes Y
                 fig = make_subplots(specs=[[{"secondary_y": True}]])
                 colors = px.colors.qualitative.Plotly
                 
-                # Regroupement par Station/Rivière/BV pour construire les courbes
                 for idx, (label, df_station) in enumerate(st.session_state.df_visu.groupby('label_complet')):
                     color = colors[idx % len(colors)]
                     
-                    # Axe Primaire : Débit absolu (m3/s) en trait plein
                     fig.add_trace(
                         go.Scatter(
                             x=df_station['date_heure'], 
@@ -251,13 +258,12 @@ if prompt := st.chat_input("Ex : Quels sont les débits en Isère sur les 3 dern
                             name=f"Q - {label}",
                             mode='lines',
                             line=dict(color=color),
-                            legendgroup=label, # Lie les deux courbes dans la légende
+                            legendgroup=label,
                             hovertemplate="<b>%{x}</b><br>Débit: %{y:.2f} m³/s<extra></extra>"
                         ),
                         secondary_y=False
                     )
                     
-                    # Axe Secondaire : Débit spécifique (l/s/km2) en pointillés
                     if df_station['debit_specifique'].notna().any():
                         fig.add_trace(
                             go.Scatter(
@@ -267,13 +273,12 @@ if prompt := st.chat_input("Ex : Quels sont les débits en Isère sur les 3 dern
                                 mode='lines',
                                 line=dict(color=color, dash='dot'),
                                 legendgroup=label,
-                                showlegend=False, # Évite de doubler la légende
+                                showlegend=False,
                                 hovertemplate="<b>%{x}</b><br>Débit Spé: %{y:.2f} l/s/km²<extra></extra>"
                             ),
                             secondary_y=True
                         )
 
-                # Optimisation de l'affichage
                 fig.update_layout(
                     template="plotly_white",
                     hovermode="x unified",
@@ -281,7 +286,6 @@ if prompt := st.chat_input("Ex : Quels sont les débits en Isère sur les 3 dern
                     margin=dict(l=20, r=20, t=30, b=20)
                 )
                 
-                # Titres des axes
                 fig.update_yaxes(title_text="<b>Débit</b> (m³/s)", secondary_y=False)
                 fig.update_yaxes(title_text="<b>Débit spécifique</b> (l/s/km²)", secondary_y=True)
                 
@@ -289,3 +293,4 @@ if prompt := st.chat_input("Ex : Quels sont les débits en Isère sur les 3 dern
                 
         except Exception as e:
             st.error(f"Erreur graphique : {e}")
+    
