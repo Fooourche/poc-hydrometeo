@@ -41,15 +41,17 @@ def extract_text(response) -> str:
         return "".join(parts)
     return str(content)
 
+# 🔒 BRIDE 1 : Historique par défaut de 3 jours
 class RequeteHydro(BaseModel):
     lieux: List[str] = Field(description="Liste des départements, cours d'eau ou villes mentionnés")
     jours_historique: int = Field(default=3, description="Nombre de jours d'historique souhaités")
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_hubeau_data_cached(query_terms):
-    headers = {"User-Agent": "Mozilla/5.0"}
+    # 🛡️ NOUVEAU : User-Agent professionnel pour éviter les blocages antibot
+    headers = {"User-Agent": "POC_Hydrometeo_EDF_DTG/1.0"}
     stations_meta = {}
-    api_logs = [] # 🛠️ NOUVEAU : Liste pour tracer l'activité réseau
+    api_logs = []
     
     for q in query_terms:
         if q.isdigit() or q in ['2A', '2B']:
@@ -62,21 +64,25 @@ def fetch_hubeau_data_cached(query_terms):
             res_ref = requests.get(ref_url, headers=headers, timeout=10)
             api_logs.append(f"🔄 [RÉFÉRENTIEL] Code HTTP : {res_ref.status_code}")
             
-            data_ref = res_ref.json()
-            stations_trouvees = data_ref.get("data", [])
-            api_logs.append(f"📍 [RÉFÉRENTIEL] Stations listées pour '{q}' : {len(stations_trouvees)}")
-            
-            for st_info in stations_trouvees:
-                code = st_info.get("code_station") or st_info.get("code_site")
-                if code and code not in stations_meta:
-                    bv = st_info.get("surface_bassin_versant_topographique") or st_info.get("surface_bassin_versant_reel") or 0.0
-                    stations_meta[code] = {
-                        "nom_station": st_info.get("libelle_station", code),
-                        "cours_eau": st_info.get("libelle_cours_eau", "Inconnu"),
-                        "surface_bv": bv
-                    }
+            # 🛡️ NOUVEAU : On s'assure que Hub'Eau a accepté la requête (Code 200) avant de lire le JSON
+            if res_ref.status_code == 200:
+                data_ref = res_ref.json()
+                stations_trouvees = data_ref.get("data", [])
+                api_logs.append(f"📍 [RÉFÉRENTIEL] Stations listées pour '{q}' : {len(stations_trouvees)}")
+                
+                for st_info in stations_trouvees:
+                    code = st_info.get("code_station") or st_info.get("code_site")
+                    if code and code not in stations_meta:
+                        bv = st_info.get("surface_bassin_versant_topographique") or st_info.get("surface_bassin_versant_reel") or 0.0
+                        stations_meta[code] = {
+                            "nom_station": st_info.get("libelle_station", code),
+                            "cours_eau": st_info.get("libelle_cours_eau", "Inconnu"),
+                            "surface_bv": bv
+                        }
+            else:
+                api_logs.append(f"❌ [RÉFÉRENTIEL] Requête bloquée par Hub'Eau (WAF/Cloudflare). Code erreur: {res_ref.status_code}")
         except Exception as e:
-            api_logs.append(f"❌ [RÉFÉRENTIEL] Erreur : {e}")
+            api_logs.append(f"❌ [RÉFÉRENTIEL] Erreur technique : {e}")
 
     if not stations_meta:
         return pd.DataFrame(), api_logs
@@ -89,6 +95,7 @@ def fetch_hubeau_data_cached(query_terms):
         chunk = station_codes[i:i + chunk_size]
         codes_param = ",".join(chunk)
         
+        # 🔒 BRIDE 2 : size=3000 pour éviter le timeout Hub'Eau
         obs_url = f"https://hubeau.eaufrance.fr/api/v1/hydrometrie/observations_tr?code_entite={codes_param}&size=3000&grandeur_hydro=Q"
         api_logs.append(f"🌊 [OBSERVATIONS] URL Chunk : {obs_url}")
         
@@ -100,38 +107,43 @@ def fetch_hubeau_data_cached(query_terms):
                 res_obs = requests.get(obs_url, headers=headers, timeout=15)
                 api_logs.append(f"🔄 [OBSERVATIONS] Code HTTP (Page {pages_fetched+1}) : {res_obs.status_code}")
                 
-                data_obs = res_obs.json()
-                obs_list = data_obs.get('data', [])
-                api_logs.append(f"💧 [OBSERVATIONS] Lignes de débits récupérées : {len(obs_list)}")
-                
-                for x in obs_list:
-                    code = x['code_entite']
-                    meta = stations_meta.get(code, {})
+                # 🛡️ NOUVEAU : Vérification HTTP 200 pour les observations
+                if res_obs.status_code == 200:
+                    data_obs = res_obs.json()
+                    obs_list = data_obs.get('data', [])
+                    api_logs.append(f"💧 [OBSERVATIONS] Lignes de débits récupérées : {len(obs_list)}")
                     
-                    q_m3s = x['resultat_obs']
-                    bv = meta.get('surface_bv', 0.0)
-                    
-                    q_sp = (q_m3s * 1000 / bv) if bv > 0 else None
-                    bv_str = f"{bv} km²" if bv > 0 else "BV Inconnu"
-                    label_complet = f"{meta.get('nom_station', code)} ({meta.get('cours_eau', '')}) - {bv_str}"
+                    for x in obs_list:
+                        code = x['code_entite']
+                        meta = stations_meta.get(code, {})
+                        
+                        q_m3s = x['resultat_obs']
+                        bv = meta.get('surface_bv', 0.0)
+                        
+                        q_sp = (q_m3s * 1000 / bv) if bv > 0 else None
+                        bv_str = f"{bv} km²" if bv > 0 else "BV Inconnu"
+                        label_complet = f"{meta.get('nom_station', code)} ({meta.get('cours_eau', '')}) - {bv_str}"
 
-                    all_obs.append({
-                        'date_heure': x['date_obs'], 
-                        'debit_m3s': q_m3s, 
-                        'debit_specifique': q_sp,
-                        'code_station': code,
-                        'station': meta.get('nom_station', code),
-                        'cours_eau': meta.get('cours_eau', ''),
-                        'surface_bv': bv,
-                        'label_complet': label_complet
-                    })
-                
-                obs_url = data_obs.get('next')
-                if obs_url:
-                    api_logs.append("➡️ [OBSERVATIONS] Pagination détectée, requête page suivante...")
-                pages_fetched += 1
+                        all_obs.append({
+                            'date_heure': x['date_obs'], 
+                            'debit_m3s': q_m3s, 
+                            'debit_specifique': q_sp,
+                            'code_station': code,
+                            'station': meta.get('nom_station', code),
+                            'cours_eau': meta.get('cours_eau', ''),
+                            'surface_bv': bv,
+                            'label_complet': label_complet
+                        })
+                    
+                    obs_url = data_obs.get('next')
+                    if obs_url:
+                        api_logs.append("➡️ [OBSERVATIONS] Pagination détectée, requête page suivante...")
+                    pages_fetched += 1
+                else:
+                    api_logs.append(f"❌ [OBSERVATIONS] Requête bloquée par Hub'Eau. Code erreur: {res_obs.status_code}")
+                    break # On arrête la pagination si on est bloqué
             except Exception as e:
-                api_logs.append(f"❌ [OBSERVATIONS] Erreur : {e}")
+                api_logs.append(f"❌ [OBSERVATIONS] Erreur technique : {e}")
                 break 
 
     df = pd.DataFrame(all_obs)
@@ -148,7 +160,6 @@ def fetch_hubeau(query_str: str, status_box) -> pd.DataFrame:
     
     status_box.write(f"🗺️ Interrogation Hub'Eau pour : `{', '.join(query_terms)}`...")
     
-    # 🛠️ NOUVEAU : Récupération du dataframe et des logs
     df, api_logs = fetch_hubeau_data_cached(query_terms)
     st.session_state.api_logs = api_logs 
     
@@ -223,7 +234,7 @@ if prompt := st.chat_input("Ex : Quelles sont les crues sur le Gard ?"):
                 df = fetch_hubeau(target, status_box=status)
                 
                 if df.empty:
-                    output_text = f"Aucune donnée d'observation récente disponible sur Hub'Eau pour '{target}'."
+                    output_text = f"Aucune donnée d'observation récente disponible sur Hub'Eau pour '{target}'. Consultez les logs réseau ci-dessous pour vérifier si l'API a bloqué la requête."
                     status.update(label="⚠️ Aucune donnée trouvée", state="complete")
                 else:
                     status.write("⚡ **Étape 3/4** : Traitement des données dans SQLite...")
@@ -234,6 +245,7 @@ if prompt := st.chat_input("Ex : Quelles sont les crues sur le Gard ?"):
                         con=st.session_state.engine
                     )
                     
+                    # 🔒 BRIDE 3 : Filtre Top 5 pour soulager les jetons LLM
                     stats_top5 = stats.nlargest(5, 'max_m3s') if not stats.empty and len(stats) > 5 else stats
                     
                     status.write("✍️ **Étape 4/4** : Synthèse par l'expert IA...")
@@ -254,6 +266,7 @@ if prompt := st.chat_input("Ex : Quelles sont les crues sur le Gard ?"):
         st.session_state.messages.append({"role": "assistant", "content": output_text})
         st.chat_message("assistant").write(output_text)
 
+        # Graphique
         try:
             if "df_visu" in st.session_state and not st.session_state.df_visu.empty:
                 st.subheader("📊 Dynamique hydrologique observée")
@@ -307,7 +320,7 @@ if prompt := st.chat_input("Ex : Quelles sont les crues sur le Gard ?"):
         except Exception as e:
             st.error(f"Erreur graphique : {e}")
 
-        # 🛠️ NOUVEAU : Bloc de transparence enrichi avec les logs réseau Hub'Eau
+        # Bloc de transparence
         with st.expander("🔍 Auditer le raisonnement et le réseau"):
             st.markdown("### 🌐 Journal Réseau Hub'Eau (Logs API)")
             if st.session_state.api_logs:
