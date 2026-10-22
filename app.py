@@ -83,7 +83,9 @@ def fetch_hubeau_data_cached(query_terms):
     for i in range(0, len(station_codes), chunk_size):
         chunk = station_codes[i:i + chunk_size]
         codes_param = ",".join(chunk)
-        obs_url = f"https://hubeau.eaufrance.fr/api/v1/hydrometrie/observations_tr?code_entite={codes_param}&size=20000&grandeur_hydro=Q"
+        
+        # 🔧 CORRECTION : size=3000 au lieu de 20000 pour éviter le timeout Hub'Eau
+        obs_url = f"https://hubeau.eaufrance.fr/api/v1/hydrometrie/observations_tr?code_entite={codes_param}&size=3000&grandeur_hydro=Q"
         
         pages_fetched = 0
         max_pages = 3 
@@ -150,14 +152,13 @@ def fetch_hubeau(query_str: str, status_box) -> pd.DataFrame:
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
 
-if prompt := st.chat_input("Ex : Quelles sont les crues en 2A et 2B ?"):
+if prompt := st.chat_input("Ex : Quelles sont les crues sur le Gard ?"):
     if not api_key:
         st.error("Ajoute ta clé API Gemini dans les Secrets ou la barre latérale.")
     else:
         st.session_state.messages.append({"role": "user", "content": prompt})
         st.chat_message("user").write(prompt)
         
-        # Initialisation de variables par défaut pour l'audit en cas de crash prématuré
         extract_prompt = ""
         raw_json = ""
         synth_prompt = ""
@@ -171,11 +172,14 @@ if prompt := st.chat_input("Ex : Quelles sont les crues en 2A et 2B ?"):
                 )
                 
                 status.write("🧠 **Étape 1/4** : Analyse sémantique (Pydantic)...")
+                
+                # 🔧 CORRECTION : Règle vitale pour forcer la conversion des départements en numéros
                 extract_prompt = f"""
                 Analyse la question de l'utilisateur. Extrais les lieux et estime la durée.
+                ⚠️ RÈGLE VITALE : Si le lieu est un département, tu DOIS retourner UNIQUEMENT son NUMÉRO officiel en chaîne de caractères (ex: 'Gard' -> '30', 'Isère' -> '38', 'Corse' -> '2A', '2B').
                 Tu dois OBLIGATOIREMENT répondre avec un objet JSON valide, selon cette structure exacte :
                 {{
-                    "lieux": ["lieu1", "lieu2"], 
+                    "lieux": ["30", "2A"], 
                     "jours_historique": entier
                 }}
                 Question : '{prompt}'
@@ -301,3 +305,4 @@ if prompt := st.chat_input("Ex : Quelles sont les crues en 2A et 2B ?"):
                 
                 st.markdown("**3. Synthèse demandée (avec les données Hub'Eau injectées) :**")
                 st.code(synth_prompt, language="text")
+                
