@@ -52,12 +52,12 @@ def fetch_hubeau_data_cached(query_terms):
     headers = {"User-Agent": "Mozilla/5.0"}
     stations_meta = {}
     
-    # 🔒 BRIDE 2 : Limite à 15 stations max par recherche
+    # 🔒 BRIDE 2 + CORRECTION : Limite à 15 stations max mesurant uniquement le débit (Q)
     for q in query_terms:
         if q.isdigit() or q in ['2A', '2B']:
-            ref_url = f"https://hubeau.eaufrance.fr/api/v1/hydrometrie/referentiel/stations?code_departement={q}&en_service=true&size=15"
+            ref_url = f"https://hubeau.eaufrance.fr/api/v1/hydrometrie/referentiel/stations?code_departement={q}&en_service=true&grandeur_hydro=Q&size=15"
         else:
-            ref_url = f"https://hubeau.eaufrance.fr/api/v1/hydrometrie/referentiel/stations?libelle_cours_eau={q}&en_service=true&size=15"
+            ref_url = f"https://hubeau.eaufrance.fr/api/v1/hydrometrie/referentiel/stations?libelle_cours_eau={q}&en_service=true&grandeur_hydro=Q&size=15"
             
         try:
             res_ref = requests.get(ref_url, headers=headers, timeout=10).json()
@@ -173,7 +173,6 @@ if prompt := st.chat_input("Ex : Quelles sont les crues sur le Gard ?"):
                 
                 status.write("🧠 **Étape 1/4** : Analyse sémantique (Pydantic)...")
                 
-                # 🔧 CORRECTION : Règle vitale pour forcer la conversion des départements en numéros
                 extract_prompt = f"""
                 Analyse la question de l'utilisateur. Extrais les lieux et estime la durée.
                 ⚠️ RÈGLE VITALE : Si le lieu est un département, tu DOIS retourner UNIQUEMENT son NUMÉRO officiel en chaîne de caractères (ex: 'Gard' -> '30', 'Isère' -> '38', 'Corse' -> '2A', '2B').
