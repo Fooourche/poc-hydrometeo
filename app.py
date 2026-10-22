@@ -13,7 +13,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage
 
 st.set_page_config(page_title="POC Hydrométéo", layout="wide")
-st.title("🌊 Assistant Hydrométéo (POC)")
+st.title("🌊 Assistant Hydrométéo (POC restreint)")
 
 # Clé API Gemini
 api_key = st.secrets.get("GOOGLE_API_KEY") or os.environ.get("GOOGLE_API_KEY", "")
@@ -42,23 +42,22 @@ def extract_text(response) -> str:
         return "".join(parts)
     return str(content)
 
-# Modèle Pydantic pour sécuriser l'extraction sémantique
+# 🔒 BRIDE 1 : On passe l'historique par défaut de 7 jours à 3 jours pour limiter la charge
 class RequeteHydro(BaseModel):
     lieux: List[str] = Field(description="Liste des départements, cours d'eau ou villes mentionnés")
-    jours_historique: int = Field(default=7, description="Nombre de jours d'historique souhaités")
+    jours_historique: int = Field(default=3, description="Nombre de jours d'historique souhaités")
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_hubeau_data_cached(query_terms):
-    """Fonction pure mise en cache pour interroger Hub'Eau (inclus Surface BV et Cours d'eau)"""
     headers = {"User-Agent": "Mozilla/5.0"}
     stations_meta = {}
     
-    # 1. Référentiel : Récupération des métadonnées (Station, Rivière, Surface BV)
+    # 🔒 BRIDE 2 : On limite size=15 (au lieu de 50) pour ne prendre que les 15 premières stations actives d'un département
     for q in query_terms:
         if q.isdigit() or q in ['2A', '2B']:
-            ref_url = f"https://hubeau.eaufrance.fr/api/v1/hydrometrie/referentiel/stations?code_departement={q}&en_service=true&size=50"
+            ref_url = f"https://hubeau.eaufrance.fr/api/v1/hydrometrie/referentiel/stations?code_departement={q}&en_service=true&size=15"
         else:
-            ref_url = f"https://hubeau.eaufrance.fr/api/v1/hydrometrie/referentiel/stations?libelle_cours_eau={q}&en_service=true&size=50"
+            ref_url = f"https://hubeau.eaufrance.fr/api/v1/hydrometrie/referentiel/stations?libelle_cours_eau={q}&en_service=true&size=15"
             
         try:
             res_ref = requests.get(ref_url, headers=headers, timeout=10).json()
@@ -79,7 +78,6 @@ def fetch_hubeau_data_cached(query_terms):
 
     station_codes = list(stations_meta.keys())
 
-    # 2. Observations avec Pagination
     all_obs = []
     chunk_size = 20
     
@@ -102,9 +100,7 @@ def fetch_hubeau_data_cached(query_terms):
                     q_m3s = x['resultat_obs']
                     bv = meta['surface_bv']
                     
-                    # Calcul du débit spécifique (l/s/km²) si le BV est connu
                     q_sp = (q_m3s * 1000 / bv) if bv > 0 else None
-                    
                     bv_str = f"{bv} km²" if bv > 0 else "BV Inconnu"
                     label_complet = f"{meta['nom_station']} ({meta['cours_eau']}) - {bv_str}"
 
@@ -124,7 +120,6 @@ def fetch_hubeau_data_cached(query_terms):
             except Exception:
                 break 
 
-    # 3. Nettoyage Pandas
     df = pd.DataFrame(all_obs)
     if not df.empty:
         df['date_heure'] = pd.to_datetime(df['date_heure'], utc=True)
@@ -135,7 +130,6 @@ def fetch_hubeau_data_cached(query_terms):
 
 
 def fetch_hubeau(query_str: str, status_box) -> pd.DataFrame:
-    """Wrapper pour l'UI, SQLite et le Session State"""
     raw_terms = str(query_str).replace("et", ",").split(",")
     query_terms = [q.strip().upper() for q in raw_terms if q.strip()]
     
@@ -148,18 +142,16 @@ def fetch_hubeau(query_str: str, status_box) -> pd.DataFrame:
         
     status_box.write(f"📊 {len(df)} observations récupérées avec métadonnées.")
     
-    # Injection dans SQLite
     df.to_sql("debits", con=st.session_state.engine, if_exists="replace", index=False)
     st.session_state.df_visu = df 
     
     return df
 
-# --- INTERFACE UTILISATEUR CHAT ---
 
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
 
-if prompt := st.chat_input("Ex : Quels sont les débits en Isère sur les 3 derniers jours ?"):
+if prompt := st.chat_input("Ex : Quelles sont les crues en 2A et 2B ?"):
     if not api_key:
         st.error("Ajoute ta clé API Gemini dans les Secrets ou la barre latérale.")
     else:
@@ -174,7 +166,6 @@ if prompt := st.chat_input("Ex : Quels sont les débits en Isère sur les 3 dern
                     google_api_key=api_key
                 )
                 
-                # Étape 1 : Extraction JSON validée par Pydantic
                 status.write("🧠 **Étape 1/4** : Analyse sémantique (Pydantic)...")
                 extract_prompt = f"""
                 Analyse la question de l'utilisateur. Extrais les lieux et estime la durée.
@@ -200,11 +191,10 @@ if prompt := st.chat_input("Ex : Quels sont les débits en Isère sur les 3 dern
                     jours = params.jours_historique
                 except Exception:
                     target = prompt
-                    jours = 7
+                    jours = 3 # Par défaut ici aussi
                 
                 status.write(f"👉 Cible : `{target}` (Historique analysé : {jours} jours)")
                 
-                # Étape 2 : Hub'Eau
                 status.write("📊 **Étape 2/4** : Consultation de Hub'Eau...")
                 df = fetch_hubeau(target, status_box=status)
                 
@@ -212,7 +202,6 @@ if prompt := st.chat_input("Ex : Quels sont les débits en Isère sur les 3 dern
                     output_text = f"Aucune donnée d'observation récente disponible sur Hub'Eau pour '{target}'."
                     status.update(label="⚠️ Aucune donnée trouvée", state="complete")
                 else:
-                    # Étape 3 : SQLite
                     status.write("⚡ **Étape 3/4** : Traitement des données dans SQLite...")
                     stats = pd.read_sql(
                         "SELECT station, cours_eau, surface_bv, "
@@ -221,12 +210,14 @@ if prompt := st.chat_input("Ex : Quels sont les débits en Isère sur les 3 dern
                         con=st.session_state.engine
                     )
                     
-                    # Étape 4 : Synthèse IA
+                    # 🔒 BRIDE 3 : On filtre le tableau pour n'envoyer à l'IA que le Top 5 des débits max
+                    stats_top5 = stats.nlargest(5, 'max_m3s') if not stats.empty and len(stats) > 5 else stats
+                    
                     status.write("✍️ **Étape 4/4** : Synthèse par l'expert IA...")
                     synth_prompt = (
                         f"Tu es un expert hydrométéorologue. "
                         f"Question de l'utilisateur : {prompt}\n\n"
-                        f"Données réelles des stations :\n{stats.to_string(index=False)}\n\n"
+                        f"Données des stations (Top 5 des débits max uniquement) :\n{stats_top5.to_string(index=False)}\n\n"
                         f"Rédige une synthèse professionnelle courte et chiffrée. N'invente AUCUN débit."
                     )
                     res_synth = llm.invoke([HumanMessage(content=synth_prompt)])
@@ -240,7 +231,6 @@ if prompt := st.chat_input("Ex : Quels sont les débits en Isère sur les 3 dern
         st.session_state.messages.append({"role": "assistant", "content": output_text})
         st.chat_message("assistant").write(output_text)
 
-        # Rendu du graphique Plotly (Double Axe)
         try:
             if "df_visu" in st.session_state and not st.session_state.df_visu.empty:
                 st.subheader("📊 Dynamique hydrologique observée")
@@ -293,4 +283,4 @@ if prompt := st.chat_input("Ex : Quels sont les débits en Isère sur les 3 dern
                 
         except Exception as e:
             st.error(f"Erreur graphique : {e}")
-    
+                
