@@ -52,12 +52,13 @@ def fetch_hubeau_data_cached(query_terms):
     headers = {"User-Agent": "Mozilla/5.0"}
     stations_meta = {}
     
-    # 🔒 BRIDE 2 + CORRECTION : Limite à 15 stations max mesurant uniquement le débit (Q)
+    # 🔧 CORRECTION : Récupération du référentiel complet sans limite de taille pour contourner 
+    # l'impossibilité de filtrer sur grandeur_hydro=Q à cette étape.
     for q in query_terms:
         if q.isdigit() or q in ['2A', '2B']:
-            ref_url = f"https://hubeau.eaufrance.fr/api/v1/hydrometrie/referentiel/stations?code_departement={q}&en_service=true&grandeur_hydro=Q&size=15"
+            ref_url = f"https://hubeau.eaufrance.fr/api/v1/hydrometrie/referentiel/stations?code_departement={q}&en_service=true"
         else:
-            ref_url = f"https://hubeau.eaufrance.fr/api/v1/hydrometrie/referentiel/stations?libelle_cours_eau={q}&en_service=true&grandeur_hydro=Q&size=15"
+            ref_url = f"https://hubeau.eaufrance.fr/api/v1/hydrometrie/referentiel/stations?libelle_cours_eau={q}&en_service=true"
             
         try:
             res_ref = requests.get(ref_url, headers=headers, timeout=10).json()
@@ -80,11 +81,12 @@ def fetch_hubeau_data_cached(query_terms):
     all_obs = []
     chunk_size = 20
     
+    # Récupération des observations (c'est ici que grandeur_hydro=Q s'applique)
     for i in range(0, len(station_codes), chunk_size):
         chunk = station_codes[i:i + chunk_size]
         codes_param = ",".join(chunk)
         
-        # 🔧 CORRECTION : size=3000 au lieu de 20000 pour éviter le timeout Hub'Eau
+        # 🔒 BRIDE 2 : size=3000 pour éviter le timeout Hub'Eau
         obs_url = f"https://hubeau.eaufrance.fr/api/v1/hydrometrie/observations_tr?code_entite={codes_param}&size=3000&grandeur_hydro=Q"
         
         pages_fetched = 0
