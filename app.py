@@ -15,7 +15,6 @@ from langchain_core.messages import HumanMessage
 st.set_page_config(page_title="POC Hydrométéo", layout="wide")
 st.title("🌊 Assistant Hydrométéo (POC restreint)")
 
-# Clé API Gemini
 api_key = st.secrets.get("GOOGLE_API_KEY") or os.environ.get("GOOGLE_API_KEY", "")
 
 if not api_key:
@@ -42,7 +41,6 @@ def extract_text(response) -> str:
         return "".join(parts)
     return str(content)
 
-# 🔒 BRIDE 1 : Historique par défaut de 3 jours
 class RequeteHydro(BaseModel):
     lieux: List[str] = Field(description="Liste des départements, cours d'eau ou villes mentionnés")
     jours_historique: int = Field(default=3, description="Nombre de jours d'historique souhaités")
@@ -51,18 +49,24 @@ class RequeteHydro(BaseModel):
 def fetch_hubeau_data_cached(query_terms):
     headers = {"User-Agent": "Mozilla/5.0"}
     stations_meta = {}
+    api_logs = [] # 🛠️ NOUVEAU : Liste pour tracer l'activité réseau
     
-    # 🔧 CORRECTION : Récupération du référentiel complet sans limite de taille pour contourner 
-    # l'impossibilité de filtrer sur grandeur_hydro=Q à cette étape.
     for q in query_terms:
         if q.isdigit() or q in ['2A', '2B']:
             ref_url = f"https://hubeau.eaufrance.fr/api/v1/hydrometrie/referentiel/stations?code_departement={q}&en_service=true"
         else:
             ref_url = f"https://hubeau.eaufrance.fr/api/v1/hydrometrie/referentiel/stations?libelle_cours_eau={q}&en_service=true"
             
+        api_logs.append(f"🔍 [RÉFÉRENTIEL] URL : {ref_url}")
         try:
-            res_ref = requests.get(ref_url, headers=headers, timeout=10).json()
-            for st_info in res_ref.get("data", []):
+            res_ref = requests.get(ref_url, headers=headers, timeout=10)
+            api_logs.append(f"🔄 [RÉFÉRENTIEL] Code HTTP : {res_ref.status_code}")
+            
+            data_ref = res_ref.json()
+            stations_trouvees = data_ref.get("data", [])
+            api_logs.append(f"📍 [RÉFÉRENTIEL] Stations listées pour '{q}' : {len(stations_trouvees)}")
+            
+            for st_info in stations_trouvees:
                 code = st_info.get("code_station") or st_info.get("code_site")
                 if code and code not in stations_meta:
                     bv = st_info.get("surface_bassin_versant_topographique") or st_info.get("surface_bassin_versant_reel") or 0.0
@@ -71,56 +75,63 @@ def fetch_hubeau_data_cached(query_terms):
                         "cours_eau": st_info.get("libelle_cours_eau", "Inconnu"),
                         "surface_bv": bv
                     }
-        except Exception:
-            pass 
+        except Exception as e:
+            api_logs.append(f"❌ [RÉFÉRENTIEL] Erreur : {e}")
 
     if not stations_meta:
-        return pd.DataFrame()
+        return pd.DataFrame(), api_logs
 
     station_codes = list(stations_meta.keys())
     all_obs = []
     chunk_size = 20
     
-    # Récupération des observations (c'est ici que grandeur_hydro=Q s'applique)
     for i in range(0, len(station_codes), chunk_size):
         chunk = station_codes[i:i + chunk_size]
         codes_param = ",".join(chunk)
         
-        # 🔒 BRIDE 2 : size=3000 pour éviter le timeout Hub'Eau
         obs_url = f"https://hubeau.eaufrance.fr/api/v1/hydrometrie/observations_tr?code_entite={codes_param}&size=3000&grandeur_hydro=Q"
+        api_logs.append(f"🌊 [OBSERVATIONS] URL Chunk : {obs_url}")
         
         pages_fetched = 0
         max_pages = 3 
         
         while obs_url and pages_fetched < max_pages:
             try:
-                res_obs = requests.get(obs_url, headers=headers, timeout=15).json()
+                res_obs = requests.get(obs_url, headers=headers, timeout=15)
+                api_logs.append(f"🔄 [OBSERVATIONS] Code HTTP (Page {pages_fetched+1}) : {res_obs.status_code}")
                 
-                for x in res_obs.get('data', []):
+                data_obs = res_obs.json()
+                obs_list = data_obs.get('data', [])
+                api_logs.append(f"💧 [OBSERVATIONS] Lignes de débits récupérées : {len(obs_list)}")
+                
+                for x in obs_list:
                     code = x['code_entite']
                     meta = stations_meta.get(code, {})
                     
                     q_m3s = x['resultat_obs']
-                    bv = meta['surface_bv']
+                    bv = meta.get('surface_bv', 0.0)
                     
                     q_sp = (q_m3s * 1000 / bv) if bv > 0 else None
                     bv_str = f"{bv} km²" if bv > 0 else "BV Inconnu"
-                    label_complet = f"{meta['nom_station']} ({meta['cours_eau']}) - {bv_str}"
+                    label_complet = f"{meta.get('nom_station', code)} ({meta.get('cours_eau', '')}) - {bv_str}"
 
                     all_obs.append({
                         'date_heure': x['date_obs'], 
                         'debit_m3s': q_m3s, 
                         'debit_specifique': q_sp,
                         'code_station': code,
-                        'station': meta['nom_station'],
-                        'cours_eau': meta['cours_eau'],
+                        'station': meta.get('nom_station', code),
+                        'cours_eau': meta.get('cours_eau', ''),
                         'surface_bv': bv,
                         'label_complet': label_complet
                     })
                 
-                obs_url = res_obs.get('next')
+                obs_url = data_obs.get('next')
+                if obs_url:
+                    api_logs.append("➡️ [OBSERVATIONS] Pagination détectée, requête page suivante...")
                 pages_fetched += 1
-            except Exception:
+            except Exception as e:
+                api_logs.append(f"❌ [OBSERVATIONS] Erreur : {e}")
                 break 
 
     df = pd.DataFrame(all_obs)
@@ -129,7 +140,7 @@ def fetch_hubeau_data_cached(query_terms):
         df = df.dropna(subset=['debit_m3s']) 
         df = df.sort_values('date_heure')
         
-    return df
+    return df, api_logs
 
 def fetch_hubeau(query_str: str, status_box) -> pd.DataFrame:
     raw_terms = str(query_str).replace("et", ",").split(",")
@@ -137,7 +148,9 @@ def fetch_hubeau(query_str: str, status_box) -> pd.DataFrame:
     
     status_box.write(f"🗺️ Interrogation Hub'Eau pour : `{', '.join(query_terms)}`...")
     
-    df = fetch_hubeau_data_cached(query_terms)
+    # 🛠️ NOUVEAU : Récupération du dataframe et des logs
+    df, api_logs = fetch_hubeau_data_cached(query_terms)
+    st.session_state.api_logs = api_logs 
     
     if df.empty:
         return pd.DataFrame()
@@ -164,6 +177,7 @@ if prompt := st.chat_input("Ex : Quelles sont les crues sur le Gard ?"):
         extract_prompt = ""
         raw_json = ""
         synth_prompt = ""
+        st.session_state.api_logs = []
         
         with st.status("🔍 Traitement en cours...", expanded=True) as status:
             try:
@@ -220,7 +234,6 @@ if prompt := st.chat_input("Ex : Quelles sont les crues sur le Gard ?"):
                         con=st.session_state.engine
                     )
                     
-                    # 🔒 BRIDE 3 : Filtre Top 5 pour soulager les jetons LLM
                     stats_top5 = stats.nlargest(5, 'max_m3s') if not stats.empty and len(stats) > 5 else stats
                     
                     status.write("✍️ **Étape 4/4** : Synthèse par l'expert IA...")
@@ -241,7 +254,6 @@ if prompt := st.chat_input("Ex : Quelles sont les crues sur le Gard ?"):
         st.session_state.messages.append({"role": "assistant", "content": output_text})
         st.chat_message("assistant").write(output_text)
 
-        # Graphique
         try:
             if "df_visu" in st.session_state and not st.session_state.df_visu.empty:
                 st.subheader("📊 Dynamique hydrologique observée")
@@ -295,15 +307,23 @@ if prompt := st.chat_input("Ex : Quelles sont les crues sur le Gard ?"):
         except Exception as e:
             st.error(f"Erreur graphique : {e}")
 
-        # Bloc de transparence pour auditer l'IA
-        if extract_prompt:
-            with st.expander("🔍 Auditer le raisonnement et les données de l'IA"):
-                st.markdown("**1. Requête d'extraction temporelle et spatiale :**")
+        # 🛠️ NOUVEAU : Bloc de transparence enrichi avec les logs réseau Hub'Eau
+        with st.expander("🔍 Auditer le raisonnement et le réseau"):
+            st.markdown("### 🌐 Journal Réseau Hub'Eau (Logs API)")
+            if st.session_state.api_logs:
+                for log in st.session_state.api_logs:
+                    st.text(log)
+            else:
+                st.text("Aucun appel réseau effectué (ou données servies depuis le cache).")
+                
+            if extract_prompt:
+                st.markdown("---")
+                st.markdown("### 🧠 Traces LLM (Gemini)")
+                st.markdown("**1. Requête d'extraction :**")
                 st.code(extract_prompt, language="text")
-                
-                st.markdown("**2. Structure JSON retournée par le LLM :**")
+                st.markdown("**2. Structure JSON retournée :**")
                 st.code(raw_json, language="json")
-                
-                st.markdown("**3. Synthèse demandée (avec les données Hub'Eau injectées) :**")
-                st.code(synth_prompt, language="text")
-                
+                if synth_prompt:
+                    st.markdown("**3. Synthèse demandée :**")
+                    st.code(synth_prompt, language="text")
+                    
