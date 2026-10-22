@@ -42,7 +42,7 @@ def extract_text(response) -> str:
         return "".join(parts)
     return str(content)
 
-# 🔒 BRIDE 1 : On passe l'historique par défaut de 7 jours à 3 jours pour limiter la charge
+# 🔒 BRIDE 1 : Historique par défaut de 3 jours
 class RequeteHydro(BaseModel):
     lieux: List[str] = Field(description="Liste des départements, cours d'eau ou villes mentionnés")
     jours_historique: int = Field(default=3, description="Nombre de jours d'historique souhaités")
@@ -52,7 +52,7 @@ def fetch_hubeau_data_cached(query_terms):
     headers = {"User-Agent": "Mozilla/5.0"}
     stations_meta = {}
     
-    # 🔒 BRIDE 2 : On limite size=15 (au lieu de 50) pour ne prendre que les 15 premières stations actives d'un département
+    # 🔒 BRIDE 2 : Limite à 15 stations max par recherche
     for q in query_terms:
         if q.isdigit() or q in ['2A', '2B']:
             ref_url = f"https://hubeau.eaufrance.fr/api/v1/hydrometrie/referentiel/stations?code_departement={q}&en_service=true&size=15"
@@ -77,7 +77,6 @@ def fetch_hubeau_data_cached(query_terms):
         return pd.DataFrame()
 
     station_codes = list(stations_meta.keys())
-
     all_obs = []
     chunk_size = 20
     
@@ -128,7 +127,6 @@ def fetch_hubeau_data_cached(query_terms):
         
     return df
 
-
 def fetch_hubeau(query_str: str, status_box) -> pd.DataFrame:
     raw_terms = str(query_str).replace("et", ",").split(",")
     query_terms = [q.strip().upper() for q in raw_terms if q.strip()]
@@ -147,6 +145,7 @@ def fetch_hubeau(query_str: str, status_box) -> pd.DataFrame:
     
     return df
 
+# --- INTERFACE UTILISATEUR CHAT ---
 
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
@@ -157,6 +156,11 @@ if prompt := st.chat_input("Ex : Quelles sont les crues en 2A et 2B ?"):
     else:
         st.session_state.messages.append({"role": "user", "content": prompt})
         st.chat_message("user").write(prompt)
+        
+        # Initialisation de variables par défaut pour l'audit en cas de crash prématuré
+        extract_prompt = ""
+        raw_json = ""
+        synth_prompt = ""
         
         with st.status("🔍 Traitement en cours...", expanded=True) as status:
             try:
@@ -179,19 +183,20 @@ if prompt := st.chat_input("Ex : Quelles sont les crues en 2A et 2B ?"):
                 res_extract = llm.invoke([HumanMessage(content=extract_prompt)])
                 raw_json = extract_text(res_extract).strip()
                 
-                if raw_json.startswith("```json"):
-                    raw_json = raw_json[7:-3].strip()
-                elif raw_json.startswith("```"):
-                    raw_json = raw_json[3:-3].strip()
+                cleaned_json = raw_json
+                if cleaned_json.startswith("```json"):
+                    cleaned_json = cleaned_json[7:-3].strip()
+                elif cleaned_json.startswith("```"):
+                    cleaned_json = cleaned_json[3:-3].strip()
                 
                 try:
-                    data_brute = json.loads(raw_json)
+                    data_brute = json.loads(cleaned_json)
                     params = RequeteHydro(**data_brute)
                     target = ",".join(params.lieux)
                     jours = params.jours_historique
                 except Exception:
                     target = prompt
-                    jours = 3 # Par défaut ici aussi
+                    jours = 3 
                 
                 status.write(f"👉 Cible : `{target}` (Historique analysé : {jours} jours)")
                 
@@ -210,7 +215,7 @@ if prompt := st.chat_input("Ex : Quelles sont les crues en 2A et 2B ?"):
                         con=st.session_state.engine
                     )
                     
-                    # 🔒 BRIDE 3 : On filtre le tableau pour n'envoyer à l'IA que le Top 5 des débits max
+                    # 🔒 BRIDE 3 : Filtre Top 5 pour soulager les jetons LLM
                     stats_top5 = stats.nlargest(5, 'max_m3s') if not stats.empty and len(stats) > 5 else stats
                     
                     status.write("✍️ **Étape 4/4** : Synthèse par l'expert IA...")
@@ -231,6 +236,7 @@ if prompt := st.chat_input("Ex : Quelles sont les crues en 2A et 2B ?"):
         st.session_state.messages.append({"role": "assistant", "content": output_text})
         st.chat_message("assistant").write(output_text)
 
+        # Graphique
         try:
             if "df_visu" in st.session_state and not st.session_state.df_visu.empty:
                 st.subheader("📊 Dynamique hydrologique observée")
@@ -283,4 +289,15 @@ if prompt := st.chat_input("Ex : Quelles sont les crues en 2A et 2B ?"):
                 
         except Exception as e:
             st.error(f"Erreur graphique : {e}")
+
+        # Bloc de transparence pour auditer l'IA
+        if extract_prompt:
+            with st.expander("🔍 Auditer le raisonnement et les données de l'IA"):
+                st.markdown("**1. Requête d'extraction temporelle et spatiale :**")
+                st.code(extract_prompt, language="text")
                 
+                st.markdown("**2. Structure JSON retournée par le LLM :**")
+                st.code(raw_json, language="json")
+                
+                st.markdown("**3. Synthèse demandée (avec les données Hub'Eau injectées) :**")
+                st.code(synth_prompt, language="text")
