@@ -46,34 +46,51 @@ class RequeteHydro(BaseModel):
     lieux: List[str] = Field(description="Liste des départements, cours d'eau ou villes mentionnés")
     jours_historique: int = Field(default=3, description="Nombre de jours d'historique souhaités")
 
+# API Hydrométrie v2 de Hub'Eau (la v1 répond 403, vérifié le 02/11/2026).
+# Débits (resultat_obs) en l/s ; une réponse paginée revient en HTTP 206.
+HUBEAU = "https://hubeau.eaufrance.fr/api/v2/hydrometrie"
+HTTP_OK = (200, 206)
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_hubeau_data_cached(query_terms):
-    # 🛡️ NOUVEAU : User-Agent professionnel pour éviter les blocages antibot
+def fetch_hubeau_data_cached(query_terms, jours):
+    # 🛡️ User-Agent explicite pour éviter les blocages antibot
     headers = {"User-Agent": "POC_Hydrometeo/1.0"}
     stations_meta = {}
     api_logs = []
-    
+
     for q in query_terms:
         if q.isdigit() or q in ['2A', '2B']:
-            ref_url = f"https://hubeau.eaufrance.fr/api/v1/hydrometrie/referentiel/stations?code_departement={q}&en_service=true"
+            filtre = f"code_departement={q}"
         else:
-            ref_url = f"https://hubeau.eaufrance.fr/api/v1/hydrometrie/referentiel/stations?libelle_cours_eau={q}&en_service=true"
-            
+            filtre = f"libelle_cours_eau={q}"
+        ref_url = f"{HUBEAU}/referentiel/stations?{filtre}&en_service=true"
+        # La surface du bassin versant est dans le référentiel des sites, pas des stations
+        sites_url = f"{HUBEAU}/referentiel/sites?{filtre}&fields=code_site,surface_bv"
+
+        surfaces = {}
+        try:
+            res_sites = requests.get(sites_url, headers=headers, timeout=10)
+            if res_sites.status_code in HTTP_OK:
+                surfaces = {s["code_site"]: s.get("surface_bv") for s in res_sites.json().get("data", [])}
+            api_logs.append(f"📐 [SITES] Surfaces de bassin lues pour '{q}' : {len(surfaces)} (HTTP {res_sites.status_code})")
+        except Exception as e:
+            api_logs.append(f"❌ [SITES] Erreur technique : {e}")
+
         api_logs.append(f"🔍 [RÉFÉRENTIEL] URL : {ref_url}")
         try:
             res_ref = requests.get(ref_url, headers=headers, timeout=10)
             api_logs.append(f"🔄 [RÉFÉRENTIEL] Code HTTP : {res_ref.status_code}")
-            
-            # 🛡️ NOUVEAU : On s'assure que Hub'Eau a accepté la requête (Code 200) avant de lire le JSON
-            if res_ref.status_code == 200:
+
+            # 🛡️ On s'assure que Hub'Eau a accepté la requête (200, ou 206 si paginée) avant de lire le JSON
+            if res_ref.status_code in HTTP_OK:
                 data_ref = res_ref.json()
                 stations_trouvees = data_ref.get("data", [])
                 api_logs.append(f"📍 [RÉFÉRENTIEL] Stations listées pour '{q}' : {len(stations_trouvees)}")
-                
+
                 for st_info in stations_trouvees:
-                    code = st_info.get("code_station") or st_info.get("code_site")
+                    code = st_info.get("code_station")
                     if code and code not in stations_meta:
-                        bv = st_info.get("surface_bassin_versant_topographique") or st_info.get("surface_bassin_versant_reel") or 0.0
+                        bv = surfaces.get(st_info.get("code_site")) or 0.0
                         stations_meta[code] = {
                             "nom_station": st_info.get("libelle_station", code),
                             "cours_eau": st_info.get("libelle_cours_eau", "Inconnu"),
@@ -90,13 +107,14 @@ def fetch_hubeau_data_cached(query_terms):
     station_codes = list(stations_meta.keys())
     all_obs = []
     chunk_size = 20
-    
+    debut = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=jours)).strftime("%Y-%m-%d")
+
     for i in range(0, len(station_codes), chunk_size):
         chunk = station_codes[i:i + chunk_size]
         codes_param = ",".join(chunk)
-        
+
         # 🔒 BRIDE 2 : size=3000 pour éviter le timeout Hub'Eau
-        obs_url = f"https://hubeau.eaufrance.fr/api/v1/hydrometrie/observations_tr?code_entite={codes_param}&size=3000&grandeur_hydro=Q"
+        obs_url = f"{HUBEAU}/observations_tr?code_entite={codes_param}&size=3000&grandeur_hydro=Q&date_debut_obs={debut}"
         api_logs.append(f"🌊 [OBSERVATIONS] URL Chunk : {obs_url}")
         
         pages_fetched = 0
@@ -107,20 +125,21 @@ def fetch_hubeau_data_cached(query_terms):
                 res_obs = requests.get(obs_url, headers=headers, timeout=15)
                 api_logs.append(f"🔄 [OBSERVATIONS] Code HTTP (Page {pages_fetched+1}) : {res_obs.status_code}")
                 
-                # 🛡️ NOUVEAU : Vérification HTTP 200 pour les observations
-                if res_obs.status_code == 200:
+                # 🛡️ Vérification HTTP (200, ou 206 si paginée) pour les observations
+                if res_obs.status_code in HTTP_OK:
                     data_obs = res_obs.json()
                     obs_list = data_obs.get('data', [])
                     api_logs.append(f"💧 [OBSERVATIONS] Lignes de débits récupérées : {len(obs_list)}")
-                    
+
                     for x in obs_list:
-                        code = x['code_entite']
+                        code = x['code_station']
                         meta = stations_meta.get(code, {})
-                        
-                        q_m3s = x['resultat_obs']
+
+                        # Hub'Eau donne les débits en l/s
+                        q_m3s = x['resultat_obs'] / 1000 if x['resultat_obs'] is not None else None
                         bv = meta.get('surface_bv', 0.0)
                         
-                        q_sp = (q_m3s * 1000 / bv) if bv > 0 else None
+                        q_sp = (q_m3s * 1000 / bv) if bv > 0 and q_m3s is not None else None
                         bv_str = f"{bv} km²" if bv > 0 else "BV Inconnu"
                         label_complet = f"{meta.get('nom_station', code)} ({meta.get('cours_eau', '')}) - {bv_str}"
 
@@ -136,9 +155,11 @@ def fetch_hubeau_data_cached(query_terms):
                         })
                     
                     obs_url = data_obs.get('next')
-                    if obs_url:
-                        api_logs.append("➡️ [OBSERVATIONS] Pagination détectée, requête page suivante...")
                     pages_fetched += 1
+                    if obs_url and pages_fetched < max_pages:
+                        api_logs.append("➡️ [OBSERVATIONS] Pagination détectée, requête page suivante...")
+                    elif obs_url:
+                        api_logs.append(f"⚠️ [OBSERVATIONS] Limite de {max_pages} pages atteinte : les observations les plus anciennes de ce groupe de stations sont tronquées.")
                 else:
                     api_logs.append(f"❌ [OBSERVATIONS] Requête bloquée par Hub'Eau. Code erreur: {res_obs.status_code}")
                     break # On arrête la pagination si on est bloqué
@@ -154,13 +175,13 @@ def fetch_hubeau_data_cached(query_terms):
         
     return df, api_logs
 
-def fetch_hubeau(query_str: str, status_box) -> pd.DataFrame:
+def fetch_hubeau(query_str: str, jours: int, status_box) -> pd.DataFrame:
     raw_terms = str(query_str).replace("et", ",").split(",")
     query_terms = [q.strip().upper() for q in raw_terms if q.strip()]
     
     status_box.write(f"🗺️ Interrogation Hub'Eau pour : `{', '.join(query_terms)}`...")
     
-    df, api_logs = fetch_hubeau_data_cached(query_terms)
+    df, api_logs = fetch_hubeau_data_cached(query_terms, jours)
     st.session_state.api_logs = api_logs 
     
     if df.empty:
@@ -231,7 +252,7 @@ if prompt := st.chat_input("Ex : Quelles sont les crues sur le Gard ?"):
                 status.write(f"👉 Cible : `{target}` (Historique analysé : {jours} jours)")
                 
                 status.write("📊 **Étape 2/4** : Consultation de Hub'Eau...")
-                df = fetch_hubeau(target, status_box=status)
+                df = fetch_hubeau(target, jours, status_box=status)
                 
                 if df.empty:
                     output_text = f"Aucune donnée d'observation récente disponible sur Hub'Eau pour '{target}'. Consultez les logs réseau ci-dessous pour vérifier si l'API a bloqué la requête."
